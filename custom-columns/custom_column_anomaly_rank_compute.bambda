@@ -1,0 +1,240 @@
+id: 38e5d980-ff44-435c-b422-d5ff9f6b2ca0
+name: Anomaly rank — compute & display (phase 2)
+function: CUSTOM_COLUMN
+location: LOGGER
+burpglobal:
+    anomaly-rank-table: anomaly_rank            # results table (string)
+    anomaly-rank-staging: anomaly_rank_pending  # staging table (string)
+source: |
+    /**
+     * Phase 2 of 2 of the anomaly rank workflow.
+     *
+     * Display format: "01x0042"
+     *   01   = frequency (zero-padded) — how many corpus rows share this rank
+     *   x    = separator
+     *   0042 = anomaly rank (zero-padded) — lower = more anomalous
+     *
+     * Sort ascending to triage:
+     *   01x0015  ← unique + highly anomalous (look here first)
+     *   01x6298  ← unique + less anomalous
+     *   03x0042  ← 3 rows share this rank (cluster, less interesting)
+     *   47x5100  ← baseline noise (skip)
+     *
+     * Requires:
+     *   - BurpDB extension (burp.db.driver.instance)
+     *   - Burp Suite 2025.10+ for rankingUtils
+     *
+     * @author ryarmst
+     **/
+
+    final var driver = (java.sql.Driver) System.getProperties().get("burp.db.driver.instance");
+    final String DB_URL = System.getProperty("burp.db.url");
+    if (driver == null || DB_URL == null || DB_URL.isBlank()) {
+        return "no DB";
+    }
+
+    if (!requestResponse.hasResponse()) {
+        return "";
+    }
+
+    final String RESULTS = java.util.Objects.requireNonNullElse(
+        System.getProperty("bg.anomaly-rank-table"), "anomaly_rank"
+    );
+    final String STAGING = java.util.Objects.requireNonNullElse(
+        System.getProperty("bg.anomaly-rank-staging"), "anomaly_rank_pending"
+    );
+    final var PROPS = new java.util.Properties();
+
+    // Ensure both tables exist.
+    try (var conn = driver.connect(DB_URL, PROPS);
+         var stmt = conn.createStatement()) {
+        stmt.execute("PRAGMA busy_timeout = 5000");
+        stmt.execute("PRAGMA journal_mode = WAL");
+        stmt.execute(
+            "CREATE TABLE IF NOT EXISTS " + STAGING + " (" +
+            "  req_hash    TEXT PRIMARY KEY," +
+            "  req_bytes   BLOB NOT NULL," +
+            "  resp_bytes  BLOB NOT NULL," +
+            "  inserted_at INTEGER NOT NULL" +
+            ")"
+        );
+        stmt.execute(
+            "CREATE TABLE IF NOT EXISTS " + RESULTS + " (" +
+            "  req_hash    TEXT PRIMARY KEY," +
+            "  rank        INTEGER NOT NULL," +
+            "  freq        INTEGER NOT NULL DEFAULT 0," +
+            "  pad_rank    INTEGER NOT NULL DEFAULT 4," +
+            "  pad_freq    INTEGER NOT NULL DEFAULT 2," +
+            "  ranked_at   INTEGER NOT NULL" +
+            ")"
+        );
+        stmt.execute(
+            "CREATE INDEX IF NOT EXISTS idx_" + RESULTS + "_rank ON " + RESULTS + "(rank)"
+        );
+    } catch (Exception e) {
+        return "DB error: " + e.getMessage();
+    }
+
+    // Hash this row.
+    byte[] reqBytes = requestResponse.request().toByteArray().getBytes();
+    String reqHash;
+    try {
+        var digest = java.security.MessageDigest.getInstance("SHA-256");
+        reqHash = java.util.HexFormat.of().formatHex(digest.digest(reqBytes));
+    } catch (Exception e) {
+        return "";
+    }
+
+    // ── Fast path: already ranked ────────────────────────────────────────────
+    try (var conn = driver.connect(DB_URL, PROPS);
+         var ps = conn.prepareStatement(
+             "SELECT rank, freq, pad_rank, pad_freq FROM " + RESULTS +
+             " WHERE req_hash = ? LIMIT 1")) {
+        ps.setString(1, reqHash);
+        try (var rs = ps.executeQuery()) {
+            if (rs.next()) {
+                int rank    = rs.getInt(1);
+                int freq    = rs.getInt(2);
+                int padRank = rs.getInt(3);
+                int padFreq = rs.getInt(4);
+                return String.format("%0" + padFreq + "d", freq)
+                     + "x"
+                     + String.format("%0" + padRank + "d", rank);
+            }
+        }
+    } catch (Exception e) {
+        return "query error";
+    }
+
+    // ── Check if ranking already ran ─────────────────────────────────────────
+    int resultsCount = 0;
+    try (var conn = driver.connect(DB_URL, PROPS);
+         var ps = conn.prepareStatement("SELECT COUNT(*) FROM " + RESULTS);
+         var rs = ps.executeQuery()) {
+        if (rs.next()) resultsCount = rs.getInt(1);
+    } catch (Exception ignored) {}
+
+    if (resultsCount > 0) {
+        return "not staged";
+    }
+
+    // ── Slow path: rank the staging corpus ───────────────────────────────────
+    var corpus = new java.util.ArrayList<HttpRequestResponse>();
+
+    try (var conn = driver.connect(DB_URL, PROPS);
+         var ps = conn.prepareStatement("SELECT req_bytes, resp_bytes FROM " + STAGING);
+         var rs = ps.executeQuery()) {
+        while (rs.next()) {
+            byte[] rqB = rs.getBytes(1);
+            byte[] rsB = rs.getBytes(2);
+            var httpReq  = HttpRequest.httpRequest(ByteArray.byteArray(rqB));
+            var httpResp = HttpResponse.httpResponse(ByteArray.byteArray(rsB));
+            corpus.add(HttpRequestResponse.httpRequestResponse(httpReq, httpResp));
+        }
+    } catch (Exception e) {
+        return "staging read error";
+    }
+
+    if (corpus.size() < 3) {
+        return "corpus too small (" + corpus.size() + ")";
+    }
+
+    java.util.List<burp.api.montoya.utilities.rank.RankedHttpRequestResponse> ranked;
+    try {
+        ranked = utilities.rankingUtils().rank(
+            corpus,
+            burp.api.montoya.utilities.rank.RankingAlgorithm.ANOMALY
+        );
+    } catch (Exception e) {
+        return "rank failed: " + e.getMessage();
+    }
+    if (ranked == null || ranked.isEmpty()) {
+        return "";
+    }
+
+    // Compute pad widths from max rank.
+    int maxRank = 0;
+    for (var r : ranked) {
+        if (r.rank() > maxRank) maxRank = r.rank();
+    }
+    int padRank = Math.max(4, String.valueOf(maxRank).length());
+
+    // Write all ranks.
+    long rankTime = System.currentTimeMillis() / 1000L;
+    int thisRowRank = -1;
+
+    try (var conn = driver.connect(DB_URL, PROPS)) {
+        conn.setAutoCommit(false);
+        try (var ps = conn.prepareStatement(
+                 "INSERT OR REPLACE INTO " + RESULTS +
+                 " (req_hash, rank, freq, pad_rank, pad_freq, ranked_at)" +
+                 " VALUES (?, ?, 0, ?, 2, ?)")) {
+            var digest = java.security.MessageDigest.getInstance("SHA-256");
+            for (var r : ranked) {
+                byte[] rb    = r.requestResponse().request().toByteArray().getBytes();
+                String rHash = java.util.HexFormat.of().formatHex(digest.digest(rb));
+                ps.setString(1, rHash);
+                ps.setInt(2, r.rank());
+                ps.setInt(3, padRank);
+                ps.setLong(4, rankTime);
+                ps.addBatch();
+                if (rHash.equals(reqHash)) {
+                    thisRowRank = r.rank();
+                }
+            }
+            ps.executeBatch();
+
+            // Compute frequency per rank value.
+            try (var freqStmt = conn.createStatement()) {
+                freqStmt.execute(
+                    "UPDATE " + RESULTS + " SET freq = (" +
+                    "  SELECT COUNT(*) FROM " + RESULTS + " r2" +
+                    "  WHERE r2.rank = " + RESULTS + ".rank" +
+                    ")"
+                );
+            }
+
+            // Compute pad_freq from max frequency.
+            try (var maxFreqStmt = conn.createStatement();
+                 var mfRs = maxFreqStmt.executeQuery(
+                     "SELECT MAX(freq) FROM " + RESULTS)) {
+                if (mfRs.next()) {
+                    int maxFreq = mfRs.getInt(1);
+                    int padFreq = Math.max(2, String.valueOf(maxFreq).length());
+                    try (var padStmt = conn.createStatement()) {
+                        padStmt.execute(
+                            "UPDATE " + RESULTS + " SET pad_freq = " + padFreq
+                        );
+                    }
+                }
+            }
+
+            conn.commit();
+        } catch (Exception e) {
+            conn.rollback();
+            return "write failed";
+        }
+    } catch (Exception e) {
+        return "";
+    }
+
+    // Return this row's result.
+    if (thisRowRank >= 0) {
+        try (var conn = driver.connect(DB_URL, PROPS);
+             var ps = conn.prepareStatement(
+                 "SELECT freq, pad_freq FROM " + RESULTS + " WHERE req_hash = ? LIMIT 1")) {
+            ps.setString(1, reqHash);
+            try (var rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    int freq    = rs.getInt(1);
+                    int padFreq = rs.getInt(2);
+                    return String.format("%0" + padFreq + "d", freq)
+                         + "x"
+                         + String.format("%0" + padRank + "d", thisRowRank);
+                }
+            }
+        } catch (Exception ignored) {}
+        return String.format("%02d", 1) + "x" + String.format("%0" + padRank + "d", thisRowRank);
+    }
+
+    return "not staged";

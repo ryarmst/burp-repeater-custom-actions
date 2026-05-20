@@ -1,0 +1,96 @@
+id: cf594789-d89f-4fe5-a051-0a014269ade2
+name: Anomaly rank — collect (phase 1)
+function: CUSTOM_COLUMN
+location: LOGGER
+burpglobal:
+    anomaly-rank-staging: anomaly_rank_pending  # staging table name (string)
+source: |
+    /**
+     * Phase 1 of 2 of the anomaly rank workflow.
+     *
+     * For every row Burp renders, store the full request and response bytes
+     * in the BurpDB staging table. This builds the corpus that phase 2 will
+     * pass to rankingUtils().rank().
+     *
+     * Displays a running count of staged rows as you scroll.
+     *
+     * Workflow:
+     *   1. Add this Bambda as a custom column in Logger.
+     *   2. Optionally run "Anomaly rank — reset DB" first for a clean slate.
+     *   3. Scroll — every painted row stages itself exactly once.
+     *   4. When the count is sufficient (20+), edit the column and replace
+     *      this Bambda with phase 2 to compute and display ranks.
+     *
+     * Requires BurpDB extension (publishes burp.db.driver.instance).
+     *
+     * @author ryarmst
+     **/
+
+    final var driver = (java.sql.Driver) System.getProperties().get("burp.db.driver.instance");
+    final String DB_URL = System.getProperty("burp.db.url");
+    if (driver == null || DB_URL == null || DB_URL.isBlank()) {
+        return "no DB";
+    }
+
+    if (!requestResponse.hasResponse()) {
+        return "";
+    }
+
+    final String STAGING = java.util.Objects.requireNonNullElse(
+        System.getProperty("bg.anomaly-rank-staging"), "anomaly_rank_pending"
+    );
+
+    // Ensure staging table exists.
+    try (var conn = driver.connect(DB_URL, new java.util.Properties());
+         var stmt = conn.createStatement()) {
+        stmt.execute("PRAGMA busy_timeout = 5000");
+        stmt.execute("PRAGMA journal_mode = WAL");
+        stmt.execute(
+            "CREATE TABLE IF NOT EXISTS " + STAGING + " (" +
+            "  req_hash    TEXT PRIMARY KEY," +
+            "  req_bytes   BLOB NOT NULL," +
+            "  resp_bytes  BLOB NOT NULL," +
+            "  inserted_at INTEGER NOT NULL" +
+            ")"
+        );
+    } catch (Exception e) {
+        return "DB error: " + e.getMessage();
+    }
+
+    // Hash this row's request bytes.
+    byte[] reqBytes = requestResponse.request().toByteArray().getBytes();
+    String reqHash;
+    try {
+        var digest = java.security.MessageDigest.getInstance("SHA-256");
+        reqHash = java.util.HexFormat.of().formatHex(digest.digest(reqBytes));
+    } catch (Exception e) {
+        return "hash error";
+    }
+
+    byte[] respBytes = requestResponse.response().toByteArray().getBytes();
+    long now = System.currentTimeMillis() / 1000L;
+
+    // Stage this row (no-op if already staged from a previous paint).
+    try (var conn = driver.connect(DB_URL, new java.util.Properties());
+         var ps = conn.prepareStatement(
+             "INSERT OR IGNORE INTO " + STAGING +
+             " (req_hash, req_bytes, resp_bytes, inserted_at) VALUES (?, ?, ?, ?)")) {
+        ps.setString(1, reqHash);
+        ps.setBytes(2, reqBytes);
+        ps.setBytes(3, respBytes);
+        ps.setLong(4, now);
+        ps.executeUpdate();
+    } catch (Exception e) {
+        return "insert error: " + e.getMessage();
+    }
+
+    // Show running corpus size.
+    try (var conn = driver.connect(DB_URL, new java.util.Properties());
+         var ps = conn.prepareStatement("SELECT COUNT(*) FROM " + STAGING);
+         var rs = ps.executeQuery()) {
+        if (rs.next()) {
+            return "staged (" + rs.getInt(1) + ")";
+        }
+    } catch (Exception ignored) {}
+
+    return "staged";
