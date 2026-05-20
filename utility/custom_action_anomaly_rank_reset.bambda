@@ -1,0 +1,82 @@
+id: 85a7f065-4ea1-4e28-8cdc-344d73ced177
+name: Anomaly rank — reset DB
+function: CUSTOM_ACTION
+location: REPEATER
+burpglobal:
+    anomaly-rank-table: anomaly_rank           # results table name (string)
+    anomaly-rank-staging: anomaly_rank_pending # staging table name (string)
+source: |
+    /**
+     * Step 0 of the anomaly rank workflow.
+     *
+     * Drops and recreates the two tables used by the anomaly rank column pair:
+     *   - anomaly_rank_pending : staging written by phase 1 (collect)
+     *   - anomaly_rank         : results written by phase 2 (compute + display)
+     *
+     * Run once before each fresh ranking pass.
+     *
+     * Requires BurpDB extension (publishes burp.db.driver.instance).
+     *
+     * @author ryarmst
+     **/
+
+    final var driver = (java.sql.Driver) System.getProperties().get("burp.db.driver.instance");
+    final String DB_URL = System.getProperty("burp.db.url");
+
+    if (driver == null || DB_URL == null || DB_URL.isBlank()) {
+        logging().logToError("[AnomalyRankReset] BurpDB not available", null);
+        return;
+    }
+
+    final String RESULTS = java.util.Objects.requireNonNullElse(
+        System.getProperty("bg.anomaly-rank-table"), "anomaly_rank"
+    );
+    final String STAGING = java.util.Objects.requireNonNullElse(
+        System.getProperty("bg.anomaly-rank-staging"), "anomaly_rank_pending"
+    );
+
+    try (var conn = driver.connect(DB_URL, new java.util.Properties());
+         var stmt = conn.createStatement()) {
+
+        stmt.execute("PRAGMA busy_timeout = 5000");
+        stmt.execute("PRAGMA journal_mode = WAL");
+
+        stmt.execute("DROP TABLE IF EXISTS " + STAGING);
+        stmt.execute("DROP TABLE IF EXISTS " + RESULTS);
+
+        stmt.execute(
+            "CREATE TABLE " + STAGING + " (" +
+            "  req_hash    TEXT PRIMARY KEY," +
+            "  req_bytes   BLOB NOT NULL," +
+            "  resp_bytes  BLOB NOT NULL," +
+            "  inserted_at INTEGER NOT NULL" +
+            ")"
+        );
+
+        stmt.execute(
+            "CREATE TABLE " + RESULTS + " (" +
+            "  req_hash    TEXT PRIMARY KEY," +
+            "  rank        INTEGER NOT NULL," +
+            "  freq        INTEGER NOT NULL DEFAULT 0," +
+            "  pad_rank    INTEGER NOT NULL DEFAULT 4," +
+            "  pad_freq    INTEGER NOT NULL DEFAULT 2," +
+            "  ranked_at   INTEGER NOT NULL" +
+            ")"
+        );
+        stmt.execute("CREATE INDEX idx_" + RESULTS + "_rank ON " + RESULTS + "(rank)");
+        stmt.execute("CREATE INDEX idx_" + RESULTS + "_freq ON " + RESULTS + "(freq)");
+
+        logging().logToOutput("[AnomalyRankReset] dropped and recreated " + STAGING + " and " + RESULTS);
+    } catch (Exception e) {
+        logging().logToError("[AnomalyRankReset] failed: " + e.getMessage(), e);
+        return;
+    }
+
+    try (var conn = driver.connect(DB_URL, new java.util.Properties());
+         var ps = conn.prepareStatement(
+             "INSERT INTO logs(created_at, reporter, details) VALUES (strftime('%s','now'), ?, ?)"
+         )) {
+        ps.setString(1, "AnomalyRankReset");
+        ps.setString(2, "Reset staging and results tables");
+        ps.executeUpdate();
+    } catch (Exception ignored) {}
