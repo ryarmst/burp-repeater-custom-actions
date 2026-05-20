@@ -1,0 +1,125 @@
+id: a2bc70ee-ce4f-4f48-907f-3f8b3ecdba3d
+name: BurpDB connection diagnostic
+function: CUSTOM_COLUMN
+location: LOGGER
+source: |
+    /**
+     * Exhaustive BurpDB connection diagnostic.
+     *
+     * Tests every possible way to connect to SQLite from a Bambda and reports
+     * exactly which step succeeds or fails. Paste this into any custom column
+     * in Logger. Each cell shows the result of the first method that works,
+     * or all failures if nothing works.
+     *
+     * @author ryarmst
+     **/
+
+    var sb = new StringBuilder();
+
+    // ── Check 1: system properties ───────────────────────────────────────────
+    String dbUrl = System.getProperty("burp.db.url");
+    String dbDriver = System.getProperty("burp.db.driver");
+    sb.append("url=").append(dbUrl != null ? dbUrl : "NULL");
+    sb.append(" drv=").append(dbDriver != null ? dbDriver : "NULL");
+
+    if (dbUrl == null || dbUrl.isBlank()) {
+        return sb.toString();
+    }
+
+    // ── Check 2: DriverManager.getConnection (will fail if classloader issue) ─
+    try {
+        try (var conn = java.sql.DriverManager.getConnection(dbUrl);
+             var stmt = conn.createStatement();
+             var rs = stmt.executeQuery("SELECT 1")) {
+            if (rs.next()) return "DM:ok";
+        }
+    } catch (Exception e1) {
+        sb.append(" | DM:").append(e1.getMessage());
+    }
+
+    // ── Check 3: driver.instance object from System.getProperties() ──────────
+    Object driverObj = System.getProperties().get("burp.db.driver.instance");
+    if (driverObj == null) {
+        sb.append(" | inst:NULL");
+    } else {
+        sb.append(" | inst:").append(driverObj.getClass().getName());
+        try {
+            var driver = (java.sql.Driver) driverObj;
+            try (var conn = driver.connect(dbUrl, new java.util.Properties());
+                 var stmt = conn.createStatement();
+                 var rs = stmt.executeQuery("SELECT 1")) {
+                if (rs.next()) return "inst:ok";
+            }
+        } catch (ClassCastException cce) {
+            sb.append(" cast:FAIL:").append(cce.getMessage());
+        } catch (Exception e2) {
+            sb.append(" conn:").append(e2.getMessage());
+        }
+    }
+
+    // ── Check 4: try loading driver via context classloader ──────────────────
+    try {
+        var cl = Thread.currentThread().getContextClassLoader();
+        sb.append(" | ctx:").append(cl != null ? cl.getClass().getName() : "NULL");
+        if (cl != null) {
+            var drvClass = cl.loadClass("org.sqlite.JDBC");
+            var drv = (java.sql.Driver) drvClass.getDeclaredConstructor().newInstance();
+            try (var conn = drv.connect(dbUrl, new java.util.Properties());
+                 var stmt = conn.createStatement();
+                 var rs = stmt.executeQuery("SELECT 1")) {
+                if (rs.next()) return "ctx:ok";
+            }
+        }
+    } catch (ClassNotFoundException cnfe) {
+        sb.append(" ctx:CNFE");
+    } catch (Exception e3) {
+        sb.append(" ctx:").append(e3.getMessage());
+    }
+
+    // ── Check 5: try loading driver via system classloader ───────────────────
+    try {
+        var scl = ClassLoader.getSystemClassLoader();
+        var drvClass = scl.loadClass("org.sqlite.JDBC");
+        var drv = (java.sql.Driver) drvClass.getDeclaredConstructor().newInstance();
+        try (var conn = drv.connect(dbUrl, new java.util.Properties());
+             var stmt = conn.createStatement();
+             var rs = stmt.executeQuery("SELECT 1")) {
+            if (rs.next()) return "sys:ok";
+        }
+    } catch (ClassNotFoundException cnfe) {
+        sb.append(" | sys:CNFE");
+    } catch (Exception e4) {
+        sb.append(" | sys:").append(e4.getMessage());
+    }
+
+    // ── Check 6: try this Bambda's own classloader ───────────────────────────
+    try {
+        var bcl = requestResponse.getClass().getClassLoader();
+        sb.append(" | bambda_cl:").append(bcl != null ? bcl.getClass().getName() : "NULL");
+        if (bcl != null) {
+            var drvClass = bcl.loadClass("org.sqlite.JDBC");
+            var drv = (java.sql.Driver) drvClass.getDeclaredConstructor().newInstance();
+            try (var conn = drv.connect(dbUrl, new java.util.Properties());
+                 var stmt = conn.createStatement();
+                 var rs = stmt.executeQuery("SELECT 1")) {
+                if (rs.next()) return "bambda:ok";
+            }
+        }
+    } catch (ClassNotFoundException cnfe) {
+        sb.append(" bambda:CNFE");
+    } catch (Exception e5) {
+        sb.append(" | bambda:").append(e5.getMessage());
+    }
+
+    // ── Check 7: list all registered DriverManager drivers ───────────────────
+    var drivers = java.sql.DriverManager.getDrivers();
+    var driverList = new java.util.ArrayList<String>();
+    while (drivers.hasMoreElements()) {
+        var d = drivers.nextElement();
+        driverList.add(d.getClass().getName() + "@" + d.getClass().getClassLoader());
+    }
+    sb.append(" | drivers:[").append(String.join(", ", driverList)).append("]");
+
+    // If nothing worked, return the full diagnostic string.
+    // It may be truncated in the column — widen the column or check the tooltip.
+    return sb.toString();
